@@ -1,0 +1,30 @@
+services:
+  - type: web # 'web' type ensures the service stays alive and can respond to HTTP checks
+    name: telegram-drm-uploader # Choose a unique name for your service
+    env: docker # We are using a Dockerfile
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free # Or your preferred plan (free plan might be slow/resource-limited for video processing)
+    # healthCheckPath: / # Flask app will respond at root
+    envVars:
+      - key: PYTHON_VERSION # Informational, actual version is from Docker base image
+        value: "3.11"
+      - key: API_ID
+        sync: false # Set this sensitive value in Render's UI
+      - key: API_HASH
+        sync: false # Set this sensitive value in Render's UI
+      - key: BOT_TOKEN
+        sync: false # Set this sensitive value in Render's UI
+      - key: OWNER_ID
+        sync: false # Set this sensitive value in Render's UI
+      - key: DEFAULT_RESOLUTION
+        value: "720" # Default video resolution if not specified by user
+      - key: DEFAULT_THUMBNAIL_URL
+        value: "no" # Default is 'no' (auto-generate thumbnail)
+      - key: CLASSPLUS_KEY_API_URL_TEMPLATE
+        value: "https://drm-api-pradeptech.onrender.com/cp?link=" # IMPORTANT: This is an example. Use a reliable one or your own.
+      - key: PW_MPD_API_URL_TEMPLATE # For "PhysicsWallah"-like platform specific MPD links
+        value: "" # e.g., "https://your-pw-api.com/get?url={mpd_url}&token={user_token}&q={quality}"
+      - key: PW_USER_TOKEN # Default token for the PW_MPD_API if user doesn't provide one
+        value: ""
+      # PORT is automatically set by Render for web services. Gunicorn/Flask will use it.
