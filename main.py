@@ -1,314 +1,313 @@
-from pyrogram.errors.exceptions.bad_request_400 import StickerEmojiInvalid
-import requests
-import m3u8
-import json
-import subprocess
 from pyrogram import Client, filters
-from pyrogram.types.messages_and_media import message
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from pyrogram.errors import FloodWait
-from pyromod import listen
 from pyrogram.types import Message
-from p_bar import progress_bar
-from subprocess import getstatusoutput
-from aiohttp import ClientSession
-import helper
-from logger import logging
+# from pyromod import listen # Not using listen in this simplified version
+import helper # Assuming helper.py is in the same directory and has necessary functions
+import logging
 import time
 import asyncio
-from pyrogram.types import User, Message
-import sys
-import re
 import os
-import urllib
-import urllib.parse
-import tgcrypto
-import cloudscraper
+import re
+import tempfile
+from pathlib import Path
+import urllib.parse # For URL encoding
+import requests # For downloading thumbnail
 
-bot = Client("bot",
-             bot_token='add',
-             api_id=add,
-             api_hash='add')
+# --- Environment Variables for Configuration ---
+# IMPORTANT: Set these in Render's Environment Variables UI for security
+# The default values here are just placeholders and for local testing if env vars are not set.
+API_ID = int(os.environ.get("API_ID", "28748671"))
+API_HASH = os.environ.get("API_HASH", "f53ec7c41ce34e6d585674ed9ce6167c")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7896165148:AAFKmmxHT01cbgqPcuHpbigHnGETVO4vSk4")
+OWNER_ID = int(os.environ.get("OWNER_ID", "1169394017")) # YOUR Telegram User ID
+DEFAULT_RESOLUTION = os.environ.get("DEFAULT_RESOLUTION", "720")
+DEFAULT_THUMBNAIL_URL = os.environ.get("DEFAULT_THUMBNAIL_URL", "no") # 'no' means auto-generate
 
-owner_id = [1169394017]
-auth_users = [1169394017]
-photo1 = 'https://envs.sh/PQ_.jpg'
-getstatusoutput(f"wget {photo1} -O 'photo.jpg'")
-photo = "photo.jpg"
+CLASSPLUS_KEY_API_URL_TEMPLATE = os.environ.get("CLASSPLUS_KEY_API_URL_TEMPLATE", "") # e.g. "https://drm-api-pradeptech.onrender.com/cp?link="
+PW_MPD_API_URL_TEMPLATE = os.environ.get("PW_MPD_API_URL_TEMPLATE", "") # e.g. "https://pw-api.com/dl?url={mpd_url}&token={user_token}&q={quality}"
+PW_USER_TOKEN_ENV = os.environ.get("PW_USER_TOKEN", "") # Default token for PW-like API
 
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO, # Set to logging.DEBUG for even more detailed Pyrogram logs if needed
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s [%(funcName)s:%(lineno)d]", # Added funcName and lineno
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+logging.getLogger("pyrogram").setLevel(logging.WARNING) # Keep Pyrogram's own logs less verbose unless debugging it
 
-token_cp = 'your cp token'
+logger.info("Logging configured.")
+logger.info(f"Attempting to initialize Pyrogram Client with API_ID: {API_ID}, Bot Token (first 5 chars): {BOT_TOKEN[:5] if BOT_TOKEN else 'None'}")
 
-@bot.on_message(filters.command(["start"]) & filters.user(owner_id))
-async def account_login(bot: Client, m: Message):
-    await m.reply_text(f"**Hello Bruh** [{m.from_user.first_name}](tg://user?id={m.from_user.id})\n>>I am TXT file Downloader Bot.\n>>Send me /txt Command And Follow Steps\nIf You Want To Stop Me Just Send /stop to stop me 😎")
+try:
+    bot = Client(
+        "render_uploader_bot_session", # Session name
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN
+    )
+    logger.info("Pyrogram Client object initialized.")
+except Exception as e_client_init:
+    logger.error(f"CRITICAL: Pyrogram Client initialization failed: {e_client_init}", exc_info=True)
+    # If client fails to init, the script might exit or bot.run() will fail later.
+    # For Render, this might cause the container to crash loop if it's a fatal init error.
+    # Consider exiting if bot object is None or critical components are missing
+    bot = None # Ensure bot is None if init fails
 
-@bot.on_message(filters.command("txt"))
-async def restart_handler(_, m):
-    await m.reply_text("🚦**STOPPED**🚦", True)
-    os.execl(sys.executable, sys.executable, *sys.argv)
+user_is_processing = {} # Simple flag to prevent concurrent processing by same user (OWNER_ID)
 
-@bot.on_message(filters.command(["txt"]))
-async def account_login(bot: Client, m: Message):
-    editable = await m.reply_text("**Please Send TXT file for download**")
-    input: Message = await bot.listen(editable.chat.id)
-    y = await input.download()
-    file_name, ext = os.path.splitext(os.path.basename(y))  # Extract filename & extension
-    x = y  # No decryption, use the file as is
-
-    path = f"./downloads/{m.chat.id}"
-
-    try:
-        with open(x, "r") as f:
-            content = f.read()
-        content = content.split("\n")
-        links = []
-        for i in content:
-            links.append(i.split("://", 1))
-        os.remove(x)
-    except:
-        await m.reply_text("Invalid file input.")
-        os.remove(x)
+@bot.on_message(filters.command("start") & filters.private)
+async def start_handler(client: Client, m: Message):
+    logger.info(f"Received /start command from user_id: {m.from_user.id}")
+    if m.from_user.id != OWNER_ID:
+        logger.warning(f"Unauthorized /start attempt by user_id: {m.from_user.id}. Expected OWNER_ID: {OWNER_ID}")
+        await m.reply_text("You are not authorized to use this bot.")
         return
 
-    await editable.edit(f"Total links found are **{len(links)}**\n\nSend From where you want to download initial is **1**")
-    input0: Message = await bot.listen(editable.chat.id)
-    raw_text = input0.text
-    await input0.delete(True)
+    if user_is_processing.get(m.from_user.id, False):
+        logger.info(f"User {m.from_user.id} sent /start while already processing.")
+        await m.reply_text("I am currently busy processing a previous request. Please wait.")
+        return
 
-    await editable.edit("**Send Me Your Batch Name or send `df` for grabing from text filename.**")
-    input1: Message = await bot.listen(editable.chat.id)
-    raw_text0 = input1.text
-    await input1.delete(True)
-    if raw_text0 == 'df':
-        b_name = file_name
-    else:
-        b_name = raw_text0
+    logger.info(f"/start command from OWNER_ID {m.from_user.id} - providing instructions.")
+    await m.reply_text(
+        f"Hello [{m.from_user.first_name}](tg://user?id={m.from_user.id})!\n"
+        "Ready to process your video links.\n\n"
+        "**Send me a `.txt` file.**\n\n"
+        "**In the caption of the TXT file, you can optionally specify (each on a new line):**\n"
+        "1. Batch Name (e.g., `Physics Lectures`)\n"
+        "2. Resolution (e.g., `720`, `1080`, `480` - default: `{DEFAULT_RESOLUTION}`p)\n"
+        "3. Thumbnail URL (direct image link, or `no` for auto-gen - default: `{DEFAULT_THUMBNAIL_URL}`)\n"
+        "4. Platform Token (if needed for specific MPD links, e.g., a PW token)\n\n"
+        "**Example Caption:**\n"
+        "```\nMy Course Batch 1\n1080\nhttps://example.com/thumb.jpg\nmytopsecrettoken123\n```"
+    )
 
-    await editable.edit("**Enter resolution** `1080` , `720` , `480` , `360` , `240` , `144`")
-    input2: Message = await bot.listen(editable.chat.id)
-    raw_text2 = input2.text
-    await input2.delete(True)
-    try:
-        if raw_text2 == "144":
-            res = "256x144"
-        elif raw_text2 == "240":
-            res = "426x240"
-        elif raw_text2 == "360":
-            res = "640x360"
-        elif raw_text2 == "480":
-            res = "854x480"
-        elif raw_text2 == "720":
-            res = "1280x720"
-        elif raw_text2 == "1080":
-            res = "1920x1080"
-        else:
-            res = "1280x720"
-    except Exception:
-        res = "UN"
+@bot.on_message(filters.document & filters.private & filters.user(OWNER_ID))
+async def handle_document(client: Client, m: Message):
+    logger.info(f"Received a document from user_id: {m.from_user.id}. Filename: {m.document.file_name if m.document else 'N/A'}")
+    if m.from_user.id != OWNER_ID: # Should be caught by filter, but good practice
+        logger.warning(f"Document received from unauthorized user_id: {m.from_user.id}")
+        return
 
-    await editable.edit("**Now Enter A Caption to add caption on your uploaded file\n\n>>OR Send `df` for use default**")
-    input3: Message = await bot.listen(editable.chat.id)
-    raw_text3 = input3.text
-    await input3.delete(True)
-    if raw_text3 == 'df':
-        MR = "Group Admin:)™"
-    else:
-        MR = raw_text3
+    if user_is_processing.get(m.from_user.id, False):
+        logger.info(f"User {m.from_user.id} sent document while already processing.")
+        await m.reply_text("Still processing a previous batch. Please wait until it's finished.")
+        return
 
-    await editable.edit("**If pw mpd links enter working token ! **")
-    input11: Message = await bot.listen(editable.chat.id)
-    token = input11.text
-    await input11.delete(True)
+    if not m.document or not m.document.file_name.endswith(".txt"):
+        logger.info(f"Received document is not a .txt file: {m.document.file_name if m.document else 'N/A'}")
+        await m.reply_text("Please send a `.txt` file.")
+        return
 
-    await editable.edit("Now send the Thumb url For Custom Thumbnail.\nExample » `https://envs.sh/Hlb.jpg` \n Or if don't want Custom Thumbnail send = `no`")
-    input6 = await bot.listen(editable.chat.id)
-    raw_text6 = input6.text
-    await input6.delete(True)
-    await editable.delete()
+    user_is_processing[m.from_user.id] = True
+    logger.info(f"Processing document: {m.document.file_name} for user_id: {m.from_user.id}")
+    editable_msg = await m.reply_text(f"File `{m.document.file_name}` received. Parsing parameters...")
 
-    thumb = input6.text
-    if thumb.startswith("http://") or thumb.startswith("https://"):
-        getstatusoutput(f"wget '{thumb}' -O 'thumb.jpg'")
-        thumb = "thumb.jpg"
-    else:
-        thumb = "no"
+    caption_lines = (m.caption.strip().split('\n') if m.caption else [])
+    logger.info(f"Caption lines received: {caption_lines}")
+    
+    batch_name_user = caption_lines[0].strip() if len(caption_lines) > 0 else None
+    quality_user = caption_lines[1].strip() if len(caption_lines) > 1 else DEFAULT_RESOLUTION
+    thumb_input_user = caption_lines[2].strip() if len(caption_lines) > 2 else DEFAULT_THUMBNAIL_URL
+    platform_token_user = caption_lines[3].strip() if len(caption_lines) > 3 else PW_USER_TOKEN_ENV
 
-    if len(links) == 1:
-        count = 1
-    else:
-        count = int(raw_text)
+    logger.info(f"Parsed params - Batch: {batch_name_user}, Quality: {quality_user}, Thumb: {thumb_input_user}, Token: {platform_token_user}")
 
-    try:
-        for i in range(count - 1, len(links)):
-            V = links[i][1].replace("file/d/","uc?export=download&id=").replace("www.youtube-nocookie.com/embed", "youtu.be").replace("?modestbranding=1", "").replace("/view?usp=sharing","")
-            url = "https://" + V
-
-            if "visionias" in url:
-                async with ClientSession() as session:
-                    async with session.get(url, headers={'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9', 'Accept-Language': 'en-US,en;q=0.9', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Pragma': 'no-cache', 'Referer': 'http://www.visionias.in/', 'Sec-Fetch-Dest': 'iframe', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Site': 'cross-site', 'Upgrade-Insecure-Requests': '1', 'User-Agent': 'Mozilla/5.0 (Linux; Android 12; RMX2121) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36', 'sec-ch-ua': '"Chromium";v="107", "Not=A?Brand";v="24"', 'sec-ch-ua-mobile': '?1', 'sec-ch-ua-platform': '"Android"',}) as resp:
-                        text = await resp.text()
-                        url = re.search(r"(https://.*?playlist.m3u8.*?)\"", text).group(1)
-            elif "https://cpvod.testbook.com/" in url:
-                url = url.replace("https://cpvod.testbook.com/","https://media-cdn.classplusapp.com/drm/")
-                url = 'https://dragoapi.vercel.app/classplus?link=' + url
-                mpd, keys = helper.get_mps_and_keys(url)
-                url = mpd
-                keys_string = " ".join([f"--key {key}" for key in keys])
-            elif "classplusapp.com/drm/" in url:
-                url = 'https://dragoapi.vercel.app/classplus?link=' + url
-                mpd, keys = helper.get_mps_and_keys(url)
-                url = mpd
-                keys_string = " ".join([f"--key {key}" for key in keys])
-            elif "edge.api.brightcove.com" in url:
-                bcov = 'bcov_auth={yourtoken} #yourcwtoken
-                url = url.split("bcov_auth")[0]+bcov
-            elif "tencdn.classplusapp" in url:
-                headers = {'Host': 'api.classplusapp.com', 'x-access-token': f'{token_cp}', 'user-agent': 'Mobile-Android', 'app-version': '1.4.37.1', 'api-version': '18', 'device-id': '5d0d17ac8b3c9f51', 'device-details': '2848b866799971ca_2848b8667a33216c_SDK-30', 'accept-encoding': 'gzip'}
-                params = (('url', f'{url}'))
-                response = requests.get('https://api.classplusapp.com/cams/uploader/video/jw-signed-url', headers=headers, params=params)
-                url = response.json()['url']
-            elif 'videos.classplusapp' in url:
-                url = requests.get(f'https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={url}', headers={'x-access-token': f'{token_cp}'}).json()['url']
-            elif 'media-cdn.classplusapp.com' in url or 'media-cdn-alisg.classplusapp.com' in url or 'media-cdn-a.classplusapp.com' in url:
-                headers = { 'x-access-token': f'{token_cp}',"X-CDN-Tag": "empty"}
-                response = requests.get(f'https://api.classplusapp.com/cams/uploader/video/jw-signed-url?url={url}', headers=headers)
-                url = response.json()['url']
-            elif 'encrypted.m' in url:
-                appxkey = url.split('*')[1]
-                url = url.split('*')[0]
-            elif url.startswith("https://videotest.adda247.com/"):
-                if url.split("/")[3] != "demo":
-                    url = f'https://videotest.adda247.com/demo/{url.split("https://videotest.adda247.com/")[1]}'
-            elif 'master.mpd' in url:
-                url = f"{api_url}pw-dl?url={url}&token={token}&authorization={api_token}&q={raw_text2}"
-
-            name1 = links[i][0].replace("\t", "").replace(":", "").replace("/", "").replace("+", "").replace("#", "").replace("|", "").replace("@", "").replace("*", "").replace(".", "").replace("https", "").replace("http", "").strip()
-            name = f'{name1[:60]} 𝐃𝐈𝐋𝐉𝐀𝐋𝐄 ❤️'
-
-            if "youtu" in url:
-                ytf = f"b[height<={raw_text2}][ext=mp4]/bv[height<={raw_text2}][ext=mp4]+ba[ext=m4a]/b[ext=mp4]"
-            else:
-                ytf = f"b[height<={raw_text2}]/bv[height<={raw_text2}]+ba/b/bv+ba"
-
-            if "jw-prod" in url:
-                cmd = f'yt-dlp -o "{name}.mp4" "{url}"'
-            else:
-                cmd = f'yt-dlp -f "{ytf}" "{url}" -o "{name}.mp4"'
-
+    with tempfile.TemporaryDirectory(prefix="bot_dl_") as temp_task_dir_str:
+        temp_task_dir = Path(temp_task_dir_str)
+        logger.info(f"Created temporary directory: {temp_task_dir}")
+        txt_file_path = await m.download(file_name=str(temp_task_dir / m.document.file_name))
+        logger.info(f"TXT file downloaded to: {txt_file_path}")
+        
+        batch_name = batch_name_user if batch_name_user else Path(txt_file_path).stem
+        quality = quality_user if quality_user.isdigit() else DEFAULT_RESOLUTION
+        
+        custom_thumb_dl_path = None
+        if thumb_input_user.lower() != "no" and thumb_input_user.startswith("http"):
+            custom_thumb_dl_path = temp_task_dir / "custom_thumb.jpg"
+            logger.info(f"Attempting to download custom thumbnail from: {thumb_input_user} to {custom_thumb_dl_path}")
             try:
-                cc = f'**╭── ⋆⋅☆⋅⋆ ──╮**\n✦ **{str(count).zfill(3)}** ✦\n**╰── ⋆⋅☆⋅⋆ ──╯**\n\n🎭 **Title:** `{name1} 😎 Admin:)™.mkv`\n🖥️ **Resolution:** [{res}]\n\n📘 **Course:** `{b_name}`\n\n🚀 **Extracted By:** `{MR}`'
-                cc1 = f'**╭── ⋆⋅☆⋅⋆ ──╮**\n✦ **{str(count).zfill(3)}** ✦\n**╰── ⋆⋅☆⋅⋆ ──╯**\n\n🎭 **Title:** `{name1} 😎 Admin:)™.pdf`\n\n📘 **Course:** `{b_name}`\n\n🚀 **Extracted By:** `{MR}`'
-                cc2 = f'**╭── ⋆⋅☆⋅⋆ ──╮**\n✦ **{str(count).zfill(3)}** ✦\n**╰── ⋆⋅☆⋅⋆ ──╯**\n\n🎭 **Title:** `{name1} 😎 Admin:)™.jpg`\n\n📘 **Course:** `{b_name}`\n\n🚀 **Extracted By:** `{MR}`'
-                ccyt = f'**╭── ⋆⋅☆⋅⋆ ──╮**\n✦ **{str(count).zfill(3)}** ✦\n**╰── ⋆⋅☆⋅⋆ ──╯**\n\n🎭 **Title:** `{name1} 😎 Admin:)™.mkv`\n🎬 **Video Link:** {url}\n🖥️ **Resolution:** [{res}]\n\n📘 **Course:** `{b_name}`\n\n🚀 **Extracted By:** `{MR}`'
+                response = requests.get(thumb_input_user, stream=True, timeout=20)
+                response.raise_for_status()
+                with open(custom_thumb_dl_path, 'wb') as f_thumb:
+                    for chunk in response.iter_content(chunk_size=8192): f_thumb.write(chunk)
+                logger.info("Custom thumbnail downloaded successfully.")
+                await editable_msg.edit_text("Custom thumbnail downloaded.")
+                await asyncio.sleep(1)
+            except Exception as e_thumb:
+                logger.error(f"Failed to download thumbnail {thumb_input_user}: {e_thumb}", exc_info=True)
+                await editable_msg.edit_text(f"Failed to download custom thumbnail. Using default/auto. Error: {str(e_thumb)[:100]}")
+                custom_thumb_dl_path = None
+                await asyncio.sleep(1)
+        
+        thumb_to_use_in_helper = str(custom_thumb_dl_path) if custom_thumb_dl_path and custom_thumb_dl_path.exists() else "no"
+        logger.info(f"Thumbnail to use in helper: {thumb_to_use_in_helper}")
 
-                if "drive" in url:
-                    try:
-                        ka = await helper.download(url, name)
-                        copy = await bot.send_document(chat_id=m.chat.id, document=ka, caption=cc1)
-                        count += 1
-                        os.remove(ka)
-                        time.sleep(1)
-                    except FloodWait as e:
-                        await m.reply_text(str(e))
-                        time.sleep(e.x)
-                        continue
+        try:
+            with open(txt_file_path, "r", encoding='utf-8') as f:
+                content_lines = [line.strip() for line in f.read().split("\n") if line.strip()]
+            logger.info(f"Read {len(content_lines)} lines from TXT file.")
+        except Exception as e_read_txt:
+            logger.error(f"Error reading TXT file {txt_file_path}: {e_read_txt}", exc_info=True)
+            await editable_msg.edit_text(f"Error reading the TXT file: {str(e_read_txt)}")
+            user_is_processing[m.from_user.id] = False
+            return
 
-                elif 'pdf*' in url:
-                    pdf_key = url.split('*')[1]
-                    url = url.split('*')[0]
-                    pdf_enc = await helper.download_and_decrypt_pdf(url, name, pdf_key)
-                    copy = await bot.send_document(chat_id=m.chat.id, document=pdf_enc, caption=cc1)
-                    count += 1
-                    os.remove(pdf_enc)
-                    continue
 
-                elif ".pdf" in url:
-                    try:
-                        cmd = f'yt-dlp -o "{name}.pdf" "{url}"'
-                        download_cmd = f"{cmd} -R 25 --fragment-retries 25"
-                        os.system(download_cmd)
-                        copy = await bot.send_document(chat_id=m.chat.id, document=f'{name}.pdf', caption=cc1)
-                        count += 1
-                        os.remove(f'{name}.pdf')
-                    except FloodWait as e:
-                        await m.reply_text(str(e))
-                        time.sleep(e.x)
-                        continue
+        if not content_lines:
+            logger.info("TXT file is empty after stripping lines.")
+            await editable_msg.edit_text("The .txt file is empty or contains no valid links.")
+            user_is_processing[m.from_user.id] = False
+            return
 
-                elif any(img in url.lower() for img in ['.jpeg', '.png', '.jpg']):
-                    try:
-                        subprocess.run(['wget', url, '-O', f'{name}.jpg'], check=True)
-                        await bot.send_photo(chat_id=m.chat.id, caption=cc2, photo=f'{name}.jpg')
-                    except subprocess.CalledProcessError:
-                        await m.reply("Failed to download the image. Please check the URL.")
-                    except Exception as e:
-                        await m.reply(f"An error occurred: {e}")
-                    finally:
-                        if os.path.exists(f'{name}.jpg'):
-                            os.remove(f'{name}.jpg')
+        await editable_msg.edit_text(f"Found {len(content_lines)} links in `{Path(txt_file_path).name}`.\nBatch: `{batch_name}`\nQuality: `{quality}p`.\nStarting processing...\nThis message will be updated with progress.")
+        
+        success_count = 0
+        failure_count = 0
 
-                elif "youtu" in url:
-                    try:
-                        await bot.send_photo(chat_id=m.chat.id, photo=photo, caption=ccyt)
-                        count += 1
-                    except Exception as e:
-                        await m.reply_text(str(e))
-                        await asyncio.sleep(1)
-                        continue
+        for i, url_line in enumerate(content_lines):
+            item_progress_text = f"Batch: `{batch_name}` - Item {i+1}/{len(content_lines)}\n"
+            logger.info(f"Processing item {i+1}: {url_line}")
+            
+            video_name_suggestion = f"video_{i+1}"
+            url = url_line.strip()
+            if ' ' in url_line:
+                possible_url_part = url_line.split(' ')[-1]
+                if possible_url_part.startswith("http"):
+                    url = possible_url_part
+                    video_name_suggestion = ' '.join(url_line.split(' ')[:-1]).strip()
+            
+            if not video_name_suggestion or video_name_suggestion == url:
+                video_name_suggestion = urllib.parse.unquote(Path(url).name.split('?')[0].split('.')[0]) or f"video_{i+1}"
 
-                elif ".ws" in url and url.endswith(".ws"):
-                    try:
-                        await helper.pdf_download(f"{api_url}utkash-ws?url={url}&authorization={api_token}", f"{name}.html")
-                        time.sleep(1)
-                        await bot.send_document(chat_id=m.chat.id, document=f"{name}.html", caption=cc1)
-                        os.remove(f'{name}.html')
-                        count += 1
-                        time.sleep(5)
-                    except FloodWait as e:
-                        await asyncio.sleep(e.x)
-                        await m.reply_text(str(e))
-                        continue
+            video_name_sanitized = re.sub(r'[\\/*?:"<>|]', "_", video_name_suggestion)[:50].strip() # Replace invalid chars with underscore
+            output_filename_base = f"{str(i+1).zfill(len(str(len(content_lines))))}_{video_name_sanitized if video_name_sanitized else f'item_{i+1}'}"
+            logger.info(f"Item base name: {output_filename_base}, URL: {url}")
 
-                elif 'encrypted.m' in url:
-                    Show = f"✈️ 𝐏𝐑𝐎𝐆𝐑𝐄𝐒𝐒 ✈️\n\n┠ 📈 Total Links = {len(links)}\n┠ 💥 Currently On = {str(count).zfill(3)}\n\n**📩 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃𝐈𝐍𝐆 📩**\n\n**🧚🏻‍♂️ Title** : {name}\n├── **Extention** : {MR}\n├── **Resolution** : {raw_text2}\n├── **Url** : `Kya karega URL dekh ke  BSDK 👻👻`\n├── **Thumbnail** : `{input6.text}`\n├── **Bot Made By** : "
-                    prog = await m.reply_text(Show)
-                    res_file = await helper.download_and_decrypt_video(url, cmd, name, appxkey)
-                    filename = res_file
-                    await prog.delete(True)
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog)
-                    count += 1
-                    await asyncio.sleep(1)
-                    continue
+            status_update_msg_content = item_progress_text + f"Processing: `{output_filename_base}`..."
+            try: await editable_msg.edit_text(status_update_msg_content)
+            except Exception: pass
 
-                elif 'drmcdni' in url or 'drm/wv' in url:
-                    Show = f"𝐏𝐑𝐎𝐆𝐑𝐄𝐒𝐒 ✈️\n\n┠ 📈 Total Links = {len(links)}\n┠ 💥 Currently On = {str(count).zfill(3)}\n\n**📩 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃𝐈𝐍𝐆 📩**\n\n**🧚🏻‍♂️ Title** : {name}\n├── **Extention** : {MR}\n├── **Resolution** : {raw_text2}\n├── **Url** : `Kya karega URL dekh ke  BSDK 👻👻`\n├── **Thumbnail** : `{input6.text}`\n├── **Bot Made By** : "
-                    prog = await m.reply_text(Show)
-                    res_file = await helper.decrypt_and_merge_video(mpd, keys_string, path, name, raw_text2)
-                    filename = res_file
-                    await prog.delete(True)
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog)
-                    count += 1
-                    await asyncio.sleep(1)
-                    continue
+            downloaded_file_path = None
+            try:
+                if CLASSPLUS_KEY_API_URL_TEMPLATE and any(domain in url for domain in ["classplusapp.com/drm/", "cpvod.testbook.com/", "media-cdn.classplusapp.com"]):
+                    logger.info(f"Classplus-like link detected: {url}")
+                    normalized_url = url
+                    if "cpvod.testbook.com/" in url:
+                        normalized_url = url.replace("cpvod.testbook.com/", "media-cdn.classplusapp.com/drm/")
+                        logger.info(f"Normalized Testbook URL to: {normalized_url}")
+                    
+                    api_call_url = f"{CLASSPLUS_KEY_API_URL_TEMPLATE}{urllib.parse.quote_plus(normalized_url)}"
+                    await editable_msg.edit_text(status_update_msg_content + "\nFetching DRM keys...")
+                    mpd_link, keys_list = helper.get_mps_and_keys(api_call_url) # This is a sync function, consider running in executor for async
+
+                    if mpd_link and keys_list:
+                        logger.info(f"DRM keys fetched. MPD: {mpd_link}, Keys count: {len(keys_list)}")
+                        downloaded_file_path = await helper.decrypt_and_merge_video(
+                            mpd_url=mpd_link, keys_list=keys_list,
+                            output_dir_str=str(temp_task_dir), output_name_base=output_filename_base, quality=quality,
+                            message_to_edit=editable_msg, context_bot=client
+                        )
+                    else:
+                        logger.warning(f"Failed to get MPD/Keys for {url} from API: {api_call_url}")
+                        await editable_msg.edit_text(status_update_msg_content + "\nERROR: Failed to get MPD/Keys from API.")
+                        failure_count += 1; continue
+                
+                # Placeholder for PW-like MPD (add specific domain checks and API logic)
+                elif PW_MPD_API_URL_TEMPLATE and "master.mpd" in url and "your_pw_platform_domain.com" in url: # Replace with actual domain
+                    logger.info(f"PW-like MPD link detected: {url}")
+                    await editable_msg.edit_text(status_update_msg_content + "\n(PW-like MPD) Fetching DRM keys... (NOT IMPLEMENTED YET)")
+                    # ... (your logic to call PW_MPD_API_URL_TEMPLATE and then helper.decrypt_and_merge_video) ...
+                    failure_count += 1; continue
 
                 else:
-                    Show = f"✈️ 𝐏𝐑𝐎𝐆𝐑𝐄𝐒𝐒 ✈️\n\n┠ 📈 Total Links = {len(links)}\n┠ 💥 Currently On = {str(count).zfill(3)}\n\n**📩 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃𝐈𝐍𝐆 📩**\n\n**🧚🏻‍♂️ Title** : {name}\n├── **Extention** : {MR}\n├── **Resolution** : {raw_text2}\n├── **Url** : `Kya karega URL dekh ke  BSDK 👻👻`\n├── **Thumbnail** : `{input6.text}`\n├── **Bot Made By** : "
-                    prog = await m.reply_text(Show)
-                    res_file = await helper.download_video(url, cmd, name)
-                    filename = res_file
-                    await prog.delete(True)
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog)
-                    count += 1
-                    time.sleep(1)
+                    logger.info(f"Using basic download for: {url}")
+                    downloaded_file_path = await helper.download_video_basic(
+                        url=url, output_name_base=output_filename_base, output_dir_str=str(temp_task_dir), quality=quality,
+                        message_to_edit=editable_msg, context_bot=client
+                    )
 
-            except Exception as e:
-                await m.reply_text(f"**downloading failed \**\n\n{str(e)}\n\n**Name** - {name}\n**Link** - {url}")
-                count += 1
-                continue
+                if downloaded_file_path and Path(downloaded_file_path).exists():
+                    logger.info(f"File successfully processed: {downloaded_file_path}")
+                    caption_text = f"**Batch:** `{batch_name}`\n**Title:** `{output_filename_base}`\n**Quality:** {quality}p"
+                    await helper.send_vid(
+                        bot=client, m=m, cc=caption_text,
+                        filename_path_str=downloaded_file_path,
+                        thumb_path_or_no=thumb_to_use_in_helper,
+                        name=f"{output_filename_base}.mp4",
+                        prog_msg_id_to_delete=None # send_vid manages its own progress now
+                    )
+                    success_count += 1
+                elif downloaded_file_path is None: # Error occurred and helper should have edited the message
+                    logger.warning(f"Download/processing returned None for {output_filename_base}.")
+                    failure_count += 1
+                else: # Path returned but file doesn't exist (should not happen if helper is correct)
+                    logger.error(f"File path {downloaded_file_path} returned but file does not exist for {output_filename_base}.")
+                    failure_count += 1
 
-    except Exception as e:
-        await m.reply_text(e)
-    await m.reply_text("**🔥 Sᴜᴄᴄᴇsғᴜʟʟʏ Dᴏᴡɴʟᴏᴀᴅᴇᴅ Aʟʟ Lᴇᴄᴛᴜʀᴇs SIR 🔥**")
 
-bot.run()
+            except Exception as e_loop:
+                logger.error(f"Critical error in main processing loop for item {output_filename_base} (URL: {url}): {e_loop}", exc_info=True)
+                try: await editable_msg.edit_text(status_update_msg_content + f"\nFATAL ITEM ERROR: {str(e_loop)[:200]}")
+                except Exception: pass
+                failure_count +=1
+            
+            logger.info(f"Item {i+1} processing finished. Success: {success_count}, Failures: {failure_count}")
+            await asyncio.sleep(1) # Small delay between items
+
+        final_summary = f"**Batch `{batch_name}` Processing Complete!**\n\nSuccessfully Uploaded: {success_count}\nFailed: {failure_count}"
+        logger.info(final_summary)
+        try: await editable_msg.edit_text(final_summary)
+        except Exception: await m.reply_text(final_summary) # If original editable deleted
+
+    # temp_task_dir and its contents are automatically cleaned up when 'with' block exits.
+    logger.info(f"Finished processing batch for user_id: {m.from_user.id}")
+    user_is_processing[m.from_user.id] = False
+
+
+# Flask app for Render's web service type (to keep it alive)
+from flask import Flask
+flask_app = Flask(__name__)
+logger.info("Flask app object created.")
+
+@flask_app.route('/')
+def route_index():
+    # logger.info("Flask / health check route hit.") # Can be very noisy
+    return 'Telegram Bot is alive and running!'
+
+def run_flask():
+    port = int(os.environ.get('PORT', 8080)) # Render sets PORT env var
+    logger.info(f"Flask app attempting to start on host 0.0.0.0, port {port}...")
+    try:
+        flask_app.run(host='0.0.0.0', port=port)
+        logger.info("Flask app run() method has exited.") # Should not happen if running continuously
+    except Exception as e_flask_run:
+        logger.error(f"Flask app run() failed: {e_flask_run}", exc_info=True)
+
+if __name__ == "__main__":
+    logger.info("Script execution started in __main__ block (main.py).")
+    if not bot:
+        logger.critical("Pyrogram Client (bot object) is None. Cannot start bot. Check initialization errors.")
+    else:
+        from threading import Thread
+        logger.info("Attempting to start Flask thread...")
+        flask_thread = Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        logger.info("Flask thread start() called. Flask should be running in background.")
+
+        logger.info("Giving Flask a moment to bind port...")
+        time.sleep(3) # Give Flask a few seconds to start up before bot takes over main thread
+
+        logger.info(f"OWNER_ID for bot operations: {OWNER_ID}")
+        logger.info(f"CLASSPLUS_KEY_API_URL_TEMPLATE: {CLASSPLUS_KEY_API_URL_TEMPLATE if CLASSPLUS_KEY_API_URL_TEMPLATE else 'Not Set'}")
+
+        try:
+            logger.info("Attempting bot.run() to start Pyrogram client...")
+            bot.run() # This will block until the bot is stopped
+            logger.info("Pyrogram client (bot.run()) has finished or been stopped.")
+        except Exception as e_bot_run:
+            logger.error(f"CRITICAL ERROR during bot.run(): {e_bot_run}", exc_info=True)
+        finally:
+            logger.info("Exiting __main__ block. Bot process is terminating.")
+            if OWNER_ID in user_is_processing: # Check if key exists before deleting
+                 user_is_processing[OWNER_ID] = False
