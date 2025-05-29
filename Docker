@@ -1,0 +1,42 @@
+FROM python:3.11-slim-bullseye
+
+ENV LANG C.UTF-8
+ENV LC_ALL C.UTF-8
+ENV PYTHONUNBUFFERED 1
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ffmpeg \
+    aria2c \
+    wget \
+    unzip \
+    # Add any other system libs if needed, e.g., libjpeg-dev for Pillow
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Bento4 (for mp4decrypt)
+RUN wget -q https://github.com/axiomatic-systems/Bento4/archive/refs/tags/v1.6.0-639.zip && \
+    unzip v1.6.0-639.zip && \
+    cd Bento4-1.6.0-639 && \
+    mkdir build && \
+    cd build && \
+    cmake .. && \
+    make -j$(nproc) && \
+    cp mp4decrypt /usr/local/bin/ && \
+    cd /app && \
+    rm -rf Bento4-1.6.0-639 v1.6.0-639.zip
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# The start command will be defined in render.yaml or Render dashboard
+# For example, Render might run: python main.py
+# Or if using gunicorn: gunicorn main:flask_app --bind 0.0.0.0:$PORT
+# If main.py handles both Flask and Pyrogram, then python main.py is enough.
+CMD ["python", "main.py"]
